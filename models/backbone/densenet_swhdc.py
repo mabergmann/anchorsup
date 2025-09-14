@@ -1,0 +1,273 @@
+"""A DenseNet backbone."""
+import torch
+import torchvision
+import torch.nn.functional as F
+import numpy as np
+import math
+
+from torch import nn
+
+from upright_anchor.models.backbone.base import IBackbone
+
+
+class _ConvNd(nn.Module):
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride,
+                 padding, dilation, transposed, output_padding, groups, bias, padding_mode):
+        super(_ConvNd, self).__init__()
+        if in_channels % groups != 0:
+            raise ValueError('in_channels must be divisible by groups')
+        if out_channels % groups != 0:
+            raise ValueError('out_channels must be divisible by groups')
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.transposed = transposed
+        self.output_padding = output_padding
+        self.padding_mode = padding_mode
+        self.groups = groups
+        if transposed:
+            self.weight = nn.parameter.Parameter(torch.Tensor(
+                in_channels, out_channels // groups, *kernel_size))
+        else:
+            self.weight = nn.parameter.Parameter(torch.Tensor(
+                out_channels, in_channels // groups, *kernel_size))
+        if bias:
+            self.bias = nn.parameter.Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        n = self.in_channels
+        for k in self.kernel_size:
+            n *= k
+        stdv = 1. / math.sqrt(n)
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def __repr__(self):
+        s = ('{name}({in_channels}, {out_channels}, kernel_size={kernel_size}'
+             ', stride={stride}')
+        if self.padding != (0,) * len(self.padding):
+            s += ', padding={padding}'
+        if self.dilation != (1,) * len(self.dilation):
+            s += ', dilation={dilation}'
+        if self.output_padding != (0,) * len(self.output_padding):
+            s += ', output_padding={output_padding}'
+        if self.groups != 1:
+            s += ', groups={groups}'
+        if self.bias is None:
+            s += ', bias=False'
+        s += ')'
+        return s.format(name=self.__class__.__name__, **self.__dict__)
+
+class Conv2dSamePadding(_ConvNd):
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros'):
+        kernel_size = torch.nn.modules.utils._pair(kernel_size)
+        stride = torch.nn.modules.utils._pair(stride)
+        padding = torch.nn.modules.utils._pair(padding)
+        dilation = torch.nn.modules.utils._pair(dilation)
+        super(Conv2dSamePadding, self).__init__(
+            in_channels, out_channels, kernel_size, stride, padding, dilation,
+            False, torch.nn.modules.utils._pair(0), groups, bias, padding_mode)
+
+    def forward(self, input, stride=1, dilation=1):
+        return conv2d_same_padding(input, self.weight, self.bias, stride,
+                        self.padding, dilation, self.groups, padding_mode=self.padding_mode)
+
+def conv2d_same_padding(input, weight, bias=None, stride=1, padding=1, dilation=1, groups=1, padding_mode='zeros'):
+    dilation = torch.nn.modules.utils._pair(dilation)
+    input_rows = input.size(2)
+    filter_rows = weight.size(2)
+    effective_filter_size_rows = (filter_rows - 1) * dilation[1] + 1
+    out_rows = (input_rows + stride - 1) // stride
+    padding_needed = max(0, (out_rows - 1) * stride + effective_filter_size_rows -
+                  input_rows)
+    padding_rows = max(0, (out_rows - 1) * stride +
+                        (filter_rows - 1) * dilation[0] + 1 - input_rows)
+    rows_odd = (padding_rows % 2 != 0)
+    padding_cols = max(0, (out_rows - 1) * stride +
+                        (filter_rows - 1) * dilation[1] + 1 - input_rows)
+    cols_odd = (padding_rows % 2 != 0)
+
+    if rows_odd or cols_odd:
+        input = torch.nn.functional.pad(input, [0, int(cols_odd), 0, int(rows_odd)], mode=padding_mode)
+
+    return F.conv2d(input, weight, bias, stride,
+                  padding=(padding_rows // 2, padding_cols // 2),
+                  dilation=dilation, groups=groups)          
+       
+
+class SDCLayerSharedWeights(nn.Module):
+    def __init__(self, input_size, n_conv, kernel_size, n_kernels, stride, padding):
+        super(SDCLayerSharedWeights, self).__init__()
+        self.input_size = input_size
+        self.n_conv = n_conv
+        self.kernel_size = kernel_size
+        self.n_kernels = n_kernels
+        self.stride = stride
+        self.padding = padding
+        
+        self.dilated_conv = Conv2dSamePadding(self.input_size, 
+                                              self.n_kernels, 
+                                              self.kernel_size, 
+                                              stride, 
+                                              padding, 
+                                              padding_mode='circular').to("cuda")
+
+        
+        self.activation = nn.ReLU()
+        
+        self.reduction = nn.Conv2d(self.input_size, self.n_kernels, kernel_size=1, stride=2, padding=0)
+        
+        self.softmax = nn.Softmax(dim=1)
+       
+
+    def forward(self, x):
+        dilated_outputs = []
+        dilated_outputs_test = []
+        
+        self_dilations = [(1,1), (1,2), (1,3), (1,4)]
+
+        if self.stride==2 or self.stride==(2,2): 
+            h, w = int(x.shape[2]/2), int(x.shape[3]/2) 
+            x = self.reduction(x)
+        else: 
+            h, w = x.shape[2], x.shape[3]
+            
+
+        n_convs = self.n_conv        
+        hardcoding_weights = np.zeros((h, n_convs))           
+        M = np.zeros((h,w))                                                             
+        phi = np.linspace(-np.pi/2, np.pi/2, num=h, endpoint=True)
+        for idx in range(h):
+            M[idx, :] = 1/np.cos(phi[idx])
+        
+        ideal_dilations = torch.from_numpy(M[:, 0]).to("cuda")                 
+        ideal_dilations = ideal_dilations.reshape(ideal_dilations.shape[0],1)      
+        dilation_rates=[1,2,3,4]  
+        
+        for i in range(h):
+            value = ideal_dilations[i,0]                      
+
+            if value >= 4:
+                hardcoding_weights[i,3] = 1.0
+                hardcoding_weights[i,:3] = 0.0
+                hardcoding_weights[-1] = hardcoding_weights[0]           
+            else:
+                differences = [abs(value - dilations) for dilations in dilation_rates] 
+                differences = torch.tensor(differences)                                 
+                idx = np.argsort(differences)[:2]                                       
+                smallest_differences = differences[idx]     
+		
+                inverse_differences = 1 / smallest_differences
+                if math.isinf(inverse_differences[0]): 
+                    inverse_differences[0] = 10 
+                weights_sum = inverse_differences.sum()
+                normalized_weights = inverse_differences / weights_sum
+                hardcoding_weights[i, idx[0]] = normalized_weights[0]
+                hardcoding_weights[i, idx[1]] = normalized_weights[1]
+
+                for j in range(1, 4):
+                    hardcoding_weights[-j] = hardcoding_weights[j-1]
+
+        final_weights = torch.from_numpy(hardcoding_weights).to("cuda") 
+        final_weights = final_weights.to(torch.float32)   
+               
+        for i in range(self.n_conv):           
+            x_d = self.dilated_conv(x, dilation=self_dilations[i]).to("cuda")
+
+            '''applying hardcoding weights to each for in the dilated feature maps'''
+            m = final_weights[:,i].unsqueeze(1)
+            s = m * x_d 
+            dilated_outputs.append(s)   
+
+                                
+        stacked = torch.stack(dilated_outputs, dim=0)    
+        final = torch.sum(stacked, dim=0)        
+        
+        return final 
+        
+
+
+class DenseNetBackboneSWHDC(IBackbone):
+    """A DenseNet backbone for the anchor generation service.
+
+    DenseNet is a convolutional neural network architecture that connects each layer to every other layer in a
+    feed-forward fashion.
+    """
+
+    def __init__(self, image_size: tuple[int, int], *, pretrained: bool = True) -> None:
+        """Initialize a new instance of DenseNetBackbone.
+
+        Args:
+            image_size (tuple[int, int]): The size of the input image.
+            pretrained (bool, optional): Whether to use a pretrained model. Defaults to True.
+        """
+        super().__init__(image_size, pretrained=pretrained)
+
+        if pretrained:
+            densenet = torchvision.models.densenet121(weights=torchvision.models.DenseNet121_Weights.IMAGENET1K_V1).to("cuda")
+        else:
+            densenet = torchvision.models.densenet121(weights=None)
+            
+        for name, module in densenet.features.named_modules():
+            if isinstance(module, torchvision.models.densenet._DenseLayer):
+                original_conv2_weight = module.conv2.weight.data
+                module.conv2 = SDCLayerSharedWeights(
+                    input_size=module.conv2.in_channels,
+                    n_conv=4,  
+                    kernel_size=module.conv2.kernel_size[0],
+                    n_kernels=module.conv2.out_channels,
+                    stride=module.conv2.stride[0],  
+                    padding=module.conv2.padding[0]  
+                )
+   
+                with torch.no_grad(): 
+                    module.conv2.dilated_conv.weight.copy_(original_conv2_weight)
+
+
+                weights_are_same = torch.equal(module.conv2.dilated_conv.weight, original_conv2_weight)
+                print(f"Weights are the same for layer {name}: {weights_are_same}")
+
+
+        self.features = densenet.features
+        self.n_features = densenet.classifier.in_features
+        self.image_size = image_size
+
+        torch.randn(1, 3, self.image_size[0], self.image_size[1]).to("cuda")
+        self.output_size = self.forward(torch.randn(1, 3, self.image_size[0], self.image_size[1])).shape[1]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor: 
+
+        """Forward pass of the DenseNet backbone.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
+        
+        #x = x.permute(0,1,3,2)
+        x = self.features(x)
+
+        return x.view(x.size(0), -1)
+
+    def get_output_features(self) -> int:
+        """Get the output size of the DenseNet backbone.
+
+        Calculates based on the number of features in the classifier and the input size.
+
+        Returns:
+            int: The output size.
+        """
+        return self.output_size
+    
