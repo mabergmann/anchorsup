@@ -1,0 +1,58 @@
+seed: 42
+data:
+    width: 442
+    height: 221
+    train_path: ../../GRAVITY-ALIGNMENT/SUN360_1024/train
+    val_path: ../../GRAVITY-ALIGNMENT/SUN360_1024/val
+    test_path: ../../GRAVITY-ALIGNMENT/SUN360_1024/test #../../GRAVITY-ALIGNMENT/SUN360_1024/test
+    lut_path: ../../GRAVITY-ALIGNMENT/SUN360_1024/lut
+    batch_size: 32
+
+trainer:
+    max_epochs: 300
+    gradient_clip_val: 5
+
+model:
+    n_anchors: 162
+    anchor_generator: icosahedron  # Options: icosahedron, single_anchor
+    backbone: densenet
+    #backbone: convnext_attention
+    angles_activation: linear
+
+metrics:
+    - angular_error
+    - median_error
+    - anchor_accuracy
+    - under_threshold_1
+    - under_threshold_2
+    - under_threshold_3
+    - under_threshold_4
+    - under_threshold_5
+    - under_threshold_12
+
+loss:
+    name: angles
+    alpha: 0.4
+
+optimizer:
+    name: adam
+    lr: 0.0001
+    weight_decay: 0.0
+
+lr_scheduler:
+    name: plateau
+    gamma: 0.5
+    step_size: 100
+    T_max: 50
+    factor: 0.1
+    patience: 50
+
+#checkpoint_path: /home/sauron/Desktop/GRAVITY-ALIGNMENT-ANCHORS/upright-anchor-tmp/upright_anchors/kynsy94g/checkpoints/best_model.ckpt
+#originais
+#lr_scheduler:
+#  name: step
+#  gamma: 0.5
+#  step_size: 30
+#  T_max: 50
+#  factor: 0.1
+#  patience: 25
